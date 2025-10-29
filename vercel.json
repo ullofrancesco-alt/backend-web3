@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "index.js",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "index.js"
+    }
+  ],
+  "env": {
+    "POLYGON_RPC_URL": "@polygon_rpc_url",
+    "DEUR_TOKEN_ADDRESS": "0xb0f517bf6cb24714b3b86f3ea8c237eb24f4d8cd",
+    "DUSD_TOKEN_ADDRESS": "0x284ffff6f55196694eca7bcb8e7a894c644355f8",
+    "DCNY_TOKEN_ADDRESS": "0xc087c1ff94e139312d8b0327cc828341061698e0",
+    "BASE44_API_URL": "@base44_api_url",
+    "BASE44_API_KEY": "@base44_api_key"
+  }
+}

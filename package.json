@@ -1,0 +1,17 @@
+{
+  "name": "epistocracy-web3-backend",
+  "version": "1.0.0",
+  "description": "Backend Web3 per monitorare acquisti token e sincronizzare con base44",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "monitor": "node monitor.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "web3": "^4.3.0",
+    "node-cron": "^3.0.3",
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1"
+  }
+}
