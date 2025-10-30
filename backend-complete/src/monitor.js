@@ -1,160 +1,148 @@
-require('dotenv').config();
-const { pool } = require('./database');
-const blockchain = require('./utils/blockchain');
+const { getWeb3, getContract } = require('./blockchain');
+const { saveDeposit } = require('./database');
 
-// Verifica se transazione è già stata processata
-async function isTransactionProcessed(txHash) {
-  const result = await pool.query(
-    'SELECT id FROM deposits WHERE tx_hash = $1',
-    [txHash]
-  );
-  return result.rows.length > 0;
-}
+const POLLING_INTERVAL = 30000; // 30 secondi
+const MIN_CONFIRMATIONS = parseInt(process.env.MIN_CONFIRMATIONS) || 12;
 
-// Salva deposito nel database
-async function saveDeposit(depositData) {
-  try {
-    const { currency, amount, from, to, txHash, blockNumber } = depositData;
-
-    // Controlla se già esiste
-    if (await isTransactionProcessed(txHash)) {
-      console.log(`⏭️ Transazione ${txHash} già processata`);
-      return;
-    }
-
-    // Ottieni conferme
-    const confirmations = await blockchain.getConfirmations(txHash);
-    const minConfirmations = parseInt(process.env.MIN_CONFIRMATIONS || 12);
-    const status = confirmations >= minConfirmations ? 'confirmed' : 'pending';
-
-    // Inserisci nel database
-    await pool.query(`
-      INSERT INTO deposits (
-        user_email, amount, currency, tx_hash, from_address, 
-        to_address, block_number, status, confirmations
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      ON CONFLICT (tx_hash) DO UPDATE SET
-        confirmations = $9,
-        status = $8,
-        confirmed_at = CASE WHEN $8 = 'confirmed' THEN NOW() ELSE deposits.confirmed_at END
-    `, [
-      'unknown@temp.com', // Placeholder, frontend associerà dopo
-      amount,
-      currency,
-      txHash,
-      from.toLowerCase(),
-      to.toLowerCase(),
-      blockNumber,
-      status,
-      confirmations
-    ]);
-
-    console.log(`✅ Deposito salvato: ${amount} ${currency} (TX: ${txHash.substring(0, 10)}...)`);
-    console.log(`   Status: ${status} (${confirmations}/${minConfirmations} conferme)`);
-
-  } catch (error) {
-    console.error('❌ Errore salvataggio deposito:', error);
+const TOKENS = {
+  DEUR: {
+    address: process.env.DEUR_TOKEN_ADDRESS,
+    name: 'Digital EUR',
+    symbol: 'DEUR'
+  },
+  DUSD: {
+    address: process.env.DUSD_TOKEN_ADDRESS,
+    name: 'Digital USD',
+    symbol: 'DUSD'
+  },
+  DCNY: {
+    address: process.env.DCNY_TOKEN_ADDRESS,
+    name: 'Digital CNH',
+    symbol: 'DCNY'
   }
-}
+};
 
-// Aggiorna conferme depositi pendenti
-async function updatePendingDeposits() {
-  try {
-    const result = await pool.query(`
-      SELECT id, tx_hash, currency
-      FROM deposits
-      WHERE status = 'pending'
-      ORDER BY created_at DESC
-      LIMIT 50
-    `);
+const PLATFORM_WALLET = process.env.PLATFORM_WALLET_ADDRESS;
 
-    if (result.rows.length === 0) return;
+let lastCheckedBlocks = {};
+let isMonitoring = false;
 
-    console.log(`🔄 Aggiorno ${result.rows.length} depositi pendenti...`);
-
-    for (const deposit of result.rows) {
-      const confirmations = await blockchain.getConfirmations(deposit.tx_hash);
-      const minConfirmations = parseInt(process.env.MIN_CONFIRMATIONS || 12);
-
-      if (confirmations >= minConfirmations) {
-        await pool.query(`
-          UPDATE deposits
-          SET status = 'confirmed',
-              confirmations = $1,
-              confirmed_at = NOW()
-          WHERE id = $2
-        `, [confirmations, deposit.id]);
-
-        console.log(`✅ Deposito ${deposit.id} confermato (${confirmations} conferme)`);
-      } else {
-        await pool.query(`
-          UPDATE deposits
-          SET confirmations = $1
-          WHERE id = $2
-        `, [confirmations, deposit.id]);
-      }
-    }
-
-  } catch (error) {
-    console.error('❌ Errore update depositi:', error);
-  }
-}
-
-// Monitor principale
 async function startMonitor() {
+  if (isMonitoring) {
+    console.log('⚠️ Monitor già attivo');
+    return;
+  }
+
   console.log('🚀 Avvio Blockchain Monitor...');
-  console.log(`📍 Wallet: ${process.env.PLATFORM_WALLET_ADDRESS}`);
-  console.log(`🔗 RPC: ${process.env.POLYGON_RPC_URL.substring(0, 50)}...`);
+  console.log(`📍 Wallet piattaforma: ${PLATFORM_WALLET}`);
+  console.log(`🔗 RPC: ${process.env.POLYGON_RPC_URL}`);
+  console.log(`⏱️ Polling ogni ${POLLING_INTERVAL/1000}s`);
+  
+  isMonitoring = true;
 
-  // Connetti WebSocket
-  await blockchain.connectWebSocket();
+  // Inizializza blocchi di partenza
+  const web3 = getWeb3();
+  const currentBlock = await web3.eth.getBlockNumber();
+  
+  for (const [key, token] of Object.entries(TOKENS)) {
+    lastCheckedBlocks[token.address] = currentBlock;
+    console.log(`👂 Monitor attivo per ${token.name} (${token.address})`);
+  }
 
-  // Ascolta nuovi depositi in real-time
-  await blockchain.listenToDeposits(async (depositData) => {
-    console.log('\n💰 NUOVO DEPOSITO RILEVATO!');
-    console.log(`   Amount: ${depositData.amount} ${depositData.currency}`);
-    console.log(`   From: ${depositData.from}`);
-    console.log(`   TX: ${depositData.txHash}`);
+  // Avvia polling
+  setInterval(async () => {
+    try {
+      await checkAllTokens();
+    } catch (error) {
+      console.error('❌ Errore nel monitor:', error.message);
+      // Non crashare, continua a monitorare
+    }
+  }, POLLING_INTERVAL);
+
+  console.log('✅ Monitor attivo e in ascolto...');
+}
+
+async function checkAllTokens() {
+  const web3 = getWeb3();
+  
+  for (const [key, token] of Object.entries(TOKENS)) {
+    try {
+      await checkToken(web3, token);
+    } catch (error) {
+      console.error(`❌ Errore check ${token.name}:`, error.message);
+    }
+  }
+}
+
+async function checkToken(web3, token) {
+  const contract = getContract(token.address);
+  const currentBlock = await web3.eth.getBlockNumber();
+  const fromBlock = lastCheckedBlocks[token.address] + 1;
+  
+  if (fromBlock > currentBlock) return;
+
+  // Cerca eventi Transfer verso il wallet piattaforma
+  const events = await contract.getPastEvents('Transfer', {
+    filter: { to: PLATFORM_WALLET },
+    fromBlock: fromBlock,
+    toBlock: currentBlock
+  });
+
+  if (events.length > 0) {
+    console.log(`\n🔍 Trovati ${events.length} trasferimenti per ${token.name}`);
+  }
+
+  for (const event of events) {
+    await processDeposit(web3, event, token, currentBlock);
+  }
+
+  lastCheckedBlocks[token.address] = currentBlock;
+}
+
+async function processDeposit(web3, event, token, currentBlock) {
+  const { from, to, value } = event.returnValues;
+  const txHash = event.transactionHash;
+  const blockNumber = event.blockNumber;
+  const confirmations = currentBlock - blockNumber;
+
+  const amount = web3.utils.fromWei(value, 'ether');
+
+  console.log(`\n💰 DEPOSITO RILEVATO:`);
+  console.log(`   Token: ${token.name}`);
+  console.log(`   From: ${from}`);
+  console.log(`   Amount: ${amount}`);
+  console.log(`   TX: ${txHash}`);
+  console.log(`   Conferme: ${confirmations}/${MIN_CONFIRMATIONS}`);
+
+  if (confirmations >= MIN_CONFIRMATIONS) {
+    // Ottieni l'email dell'utente (TODO: implementare mapping wallet->email)
+    // Per ora usiamo il from address come identificatore
+    const userEmail = from.toLowerCase();
+
+    console.log(`✅ Deposito confermato! Salvataggio...`);
     
-    await saveDeposit(depositData);
-  });
+    await saveDeposit({
+      userEmail,
+      userWalletAddress: from,
+      amount: parseFloat(amount),
+      currency: token.name,
+      txHash,
+      blockNumber,
+      status: 'confirmed'
+    });
 
-  // Aggiorna depositi pendenti ogni 30 secondi
-  setInterval(updatePendingDeposits, 30000);
-
-  console.log('\n✅ Monitor attivo e in ascolto...\n');
+    console.log(`✅ Deposito salvato per ${userEmail}`);
+  } else {
+    console.log(`⏳ In attesa di ${MIN_CONFIRMATIONS - confirmations} conferme...`);
+  }
 }
 
-// Gestione errori e restart
-process.on('uncaughtException', (error) => {
-  console.error('❌ Uncaught Exception:', error);
-  setTimeout(() => {
-    console.log('🔄 Riavvio monitor...');
-    startMonitor();
-  }, 5000);
-});
-
-process.on('unhandledRejection', (error) => {
-  console.error('❌ Unhandled Rejection:', error);
-});
-
-// Gestione chiusura pulita
-process.on('SIGTERM', () => {
-  console.log('⚠️ SIGTERM ricevuto, chiusura...');
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  console.log('⚠️ SIGINT ricevuto, chiusura...');
-  process.exit(0);
-});
-
-// Avvia monitor
-if (require.main === module) {
-  startMonitor().catch((error) => {
-    console.error('❌ Errore fatale:', error);
-    process.exit(1);
-  });
+function stopMonitor() {
+  isMonitoring = false;
+  console.log('🛑 Monitor fermato');
 }
 
-module.exports = { startMonitor, saveDeposit, updatePendingDeposits };
+module.exports = {
+  startMonitor,
+  stopMonitor
+};
