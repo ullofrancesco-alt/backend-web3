@@ -5,107 +5,6 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Inizializza database schema
-async function initDatabase() {
-  console.log('🔧 Inizializzazione database...');
-  
-  try {
-    // Tabella depositi
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS deposits (
-        id SERIAL PRIMARY KEY,
-        user_email VARCHAR(255) NOT NULL,
-        amount DECIMAL(18,8) NOT NULL,
-        currency VARCHAR(50) NOT NULL,
-        tx_hash VARCHAR(100) UNIQUE NOT NULL,
-        from_address VARCHAR(50),
-        to_address VARCHAR(50),
-        block_number BIGINT,
-        status VARCHAR(20) DEFAULT 'pending',
-        confirmations INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT NOW(),
-        confirmed_at TIMESTAMP,
-        processed_at TIMESTAMP
-      );
-      
-      CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_email);
-      CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status);
-      CREATE INDEX IF NOT EXISTS idx_deposits_tx ON deposits(tx_hash);
-    `);
-
-    // Tabella prelievi
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS withdrawals (
-        id SERIAL PRIMARY KEY,
-        user_email VARCHAR(255) NOT NULL,
-        amount DECIMAL(18,8) NOT NULL,
-        fee DECIMAL(18,8) NOT NULL,
-        net_amount DECIMAL(18,8) NOT NULL,
-        currency VARCHAR(50) NOT NULL,
-        to_address VARCHAR(50) NOT NULL,
-        tx_hash VARCHAR(100),
-        status VARCHAR(20) DEFAULT 'pending',
-        error_message TEXT,
-        created_at TIMESTAMP DEFAULT NOW(),
-        processed_at TIMESTAMP,
-        completed_at TIMESTAMP
-      );
-      
-      CREATE INDEX IF NOT EXISTS idx_withdrawals_user ON withdrawals(user_email);
-      CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON withdrawals(status);
-    `);
-
-    // Tabella limiti giornalieri
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS daily_limits (
-        id SERIAL PRIMARY KEY,
-        user_email VARCHAR(255) NOT NULL,
-        date DATE NOT NULL DEFAULT CURRENT_DATE,
-        total_withdrawn DECIMAL(18,8) DEFAULT 0,
-        UNIQUE(user_email, date)
-      );
-      
-      CREATE INDEX IF NOT EXISTS idx_limits_user_date ON daily_limits(user_email, date);
-    `);
-
-    // Tabella eventi blockchain
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS blockchain_events (
-        id SERIAL PRIMARY KEY,
-        event_type VARCHAR(50) NOT NULL,
-        tx_hash VARCHAR(100) NOT NULL,
-        block_number BIGINT NOT NULL,
-        data JSONB,
-        processed BOOLEAN DEFAULT false,
-        created_at TIMESTAMP DEFAULT NOW(),
-        UNIQUE(tx_hash, event_type)
-      );
-      
-      CREATE INDEX IF NOT EXISTS idx_events_block ON blockchain_events(block_number);
-      CREATE INDEX IF NOT EXISTS idx_events_processed ON blockchain_events(processed);
-    `);
-
-    // Tabella monitoraggio (ultimo blocco sincronizzato)
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS sync_state (
-        id SERIAL PRIMARY KEY,
-        last_block_number BIGINT NOT NULL,
-        last_sync_at TIMESTAMP DEFAULT NOW()
-      );
-      
-      INSERT INTO sync_state (last_block_number)
-      SELECT 0
-      WHERE NOT EXISTS (SELECT 1 FROM sync_state LIMIT 1);
-    `);
-
-    console.log('✅ Database inizializzato con successo!');
-  } catch (error) {
-    console.error('❌ Errore inizializzazione database:', error);
-    throw error;
-  }
-}
-
-// Test connessione
 async function testConnection() {
   try {
     const result = await pool.query('SELECT NOW()');
@@ -117,22 +16,108 @@ async function testConnection() {
   }
 }
 
-module.exports = {
-  pool,
-  initDatabase,
-  testConnection
-};
-
-// Se eseguito direttamente, inizializza DB
-if (require.main === module) {
-  require('dotenv').config();
-  initDatabase()
-    .then(() => {
-      console.log('✅ Setup completato');
-      process.exit(0);
-    })
-    .catch((error) => {
-      console.error('❌ Setup fallito:', error);
-      process.exit(1);
-    });
+async function initDatabase() {
+  const createDepositsTable = `
+    CREATE TABLE IF NOT EXISTS deposits (
+      id SERIAL PRIMARY KEY,
+      user_email VARCHAR(255) NOT NULL,
+      user_wallet_address VARCHAR(42) NOT NULL,
+      amount DECIMAL(20, 6) NOT NULL,
+      currency VARCHAR(50) NOT NULL,
+      tx_hash VARCHAR(66) UNIQUE NOT NULL,
+      block_number BIGINT NOT NULL,
+      status VARCHAR(20) DEFAULT 'confirmed',
+      created_at TIMESTAMP DEFAULT NOW(),
+      processed_at TIMESTAMP
+    );
+  `;
+  
+  const createWithdrawalsTable = `
+    CREATE TABLE IF NOT EXISTS withdrawals (
+      id SERIAL PRIMARY KEY,
+      user_email VARCHAR(255) NOT NULL,
+      amount DECIMAL(20, 6) NOT NULL,
+      currency VARCHAR(50) NOT NULL,
+      to_address VARCHAR(42) NOT NULL,
+      tx_hash VARCHAR(66),
+      status VARCHAR(20) DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT NOW(),
+      processed_at TIMESTAMP
+    );
+  `;
+  
+  await pool.query(createDepositsTable);
+  await pool.query(createWithdrawalsTable);
+  
+  console.log('✅ Tabelle database OK');
 }
+
+async function saveDeposit(data) {
+  const { userEmail, userWalletAddress, amount, currency, txHash, blockNumber, status } = data;
+  
+  // Check if already exists
+  const existing = await pool.query('SELECT id FROM deposits WHERE tx_hash = $1', [txHash]);
+  if (existing.rows.length > 0) {
+    console.log('⚠️ Deposito già esistente, skip');
+    return existing.rows[0].id;
+  }
+  
+  const result = await pool.query(
+    'INSERT INTO deposits (user_email, user_wallet_address, amount, currency, tx_hash, block_number, status) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
+    [userEmail, userWalletAddress, amount, currency, txHash, blockNumber, status]
+  );
+  
+  return result.rows[0].id;
+}
+
+async function getPendingDeposits(userEmail) {
+  const result = await pool.query(
+    'SELECT * FROM deposits WHERE user_email = $1 AND processed_at IS NULL ORDER BY created_at DESC',
+    [userEmail]
+  );
+  return result.rows;
+}
+
+async function markDepositsProcessed(depositIds) {
+  await pool.query(
+    'UPDATE deposits SET processed_at = NOW() WHERE id = ANY($1)',
+    [depositIds]
+  );
+}
+
+async function createWithdrawalRequest(data) {
+  const { userEmail, amount, currency, toAddress } = data;
+  
+  const result = await pool.query(
+    'INSERT INTO withdrawals (user_email, amount, currency, to_address, status) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+    [userEmail, amount, currency, toAddress, 'pending']
+  );
+  
+  return result.rows[0].id;
+}
+
+async function getPendingWithdrawals() {
+  const result = await pool.query(
+    'SELECT * FROM withdrawals WHERE status = $1 ORDER BY created_at ASC',
+    ['pending']
+  );
+  return result.rows;
+}
+
+async function updateWithdrawalStatus(id, status, txHash = null) {
+  await pool.query(
+    'UPDATE withdrawals SET status = $1, tx_hash = $2, processed_at = NOW() WHERE id = $3',
+    [status, txHash, id]
+  );
+}
+
+module.exports = {
+  testConnection,
+  initDatabase,
+  saveDeposit,
+  getPendingDeposits,
+  markDepositsProcessed,
+  createWithdrawalRequest,
+  getPendingWithdrawals,
+  updateWithdrawalStatus
+};
